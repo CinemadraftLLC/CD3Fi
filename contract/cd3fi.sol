@@ -833,7 +833,7 @@ contract CD3Fi is IBEP20, Ownable {
     using EnumerableSet for EnumerableSet.AddressSet;
     using SafeMath for uint256;
 
-    event TaxedTransfer(address indexed from, address indexed to, uint value, bool isBuy, bool isSell);
+    event TaxedTransfer(address indexed from, address indexed to, uint tax, uint dTax, uint busdTax, uint cd3fiTax, uint marketTax, uint burnTax, uint getBusdRTax, uint getBusdMTax);
     event FeelessTransfer(address indexed from, address indexed to, uint value);
     event ExcludedTransfer(bool isContractTransfer, bool isLiquidityTransfer, bool isExcluded, bool isBuy, bool isSell);
     event DistributeBusdReward(uint busdReward, uint marketFee, uint stableAmount);
@@ -850,11 +850,7 @@ contract CD3Fi is IBEP20, Ownable {
     string private constant _symbol = 'CD3Fi';
     uint8 private constant _decimals = 6;
     uint256 public _totalSupply= 80 * 10**6 * 10**_decimals;//equals 10000
-    uint256 public constant _maxSupply= 80 * 10**6 * 10**_decimals;//equals 80M
-    
-    uint256 private stableFundBalance = 0;
-    uint256 private busdRewardBalance = 0;
-    uint256 private marketingFundBalance = 0;
+    uint256 public constant _maxSupply= 80 * 10**6 * 10**_decimals;//equals 80M    
 
     uint8 private _liquidityTax;
     uint8 private _buyTax;
@@ -895,6 +891,11 @@ contract CD3Fi is IBEP20, Ownable {
         uint256 dynamicTaxAmount;
         uint256 CD3FiAmountForMarketingFee;
         uint256 swapTaxAmountIn;
+    }
+
+    struct RewardData {
+        uint256 marketingFundBalance;
+        uint256 busdRewardBalance;      
     }
     
     //Locks the swap if already swapping
@@ -952,18 +953,22 @@ contract CD3Fi is IBEP20, Ownable {
 
         //Transactions from and to the contract are always tax and lock free
         bool isContractTransfer=(sender==address(this) || recipient==address(this));
-        bool isChildContractTransfer = (sender==address(_childContract)) || recipient==address(_childContract);
+        bool isChildContractTransfer = sender==address(_childContract) || recipient==address(_childContract);
         //transfers between PancakeRouter and PancakePair are tax and lock free
         address pancakeRouter=address(_pancakeRouter);
         bool isLiquidityTransfer = ((sender == _pancakePairAddress && recipient == pancakeRouter) 
         || (recipient == _pancakePairAddress && sender == pancakeRouter));        
+        // bool isLiquidityTransfer = sender == _pancakePairAddress||recipient == _pancakePairAddress;        
 
         //differentiate between buy/sell/transfer to apply different taxes/restrictions
-        bool isSell = recipient==_pancakePairAddress || recipient == pancakeRouter;
-        bool isBuy = sender==_pancakePairAddress || sender == pancakeRouter;
+        // bool isSell = recipient==_pancakePairAddress || recipient == pancakeRouter;
+        // bool isBuy = sender==_pancakePairAddress || sender == pancakeRouter;        
+        bool isSell = isContract(recipient);
+        bool isBuy = isContract(sender);        
+        bool isTrade = !isSell&&!isBuy;
 
         //Pick transfer        
-        if(isContractTransfer || isChildContractTransfer || isLiquidityTransfer || isExcluded){            
+        if(isContractTransfer || isChildContractTransfer || isLiquidityTransfer || isExcluded || isTrade){            
             _feelessTransfer(sender, recipient, amount);            
         }
         else{ 
@@ -978,10 +983,8 @@ contract CD3Fi is IBEP20, Ownable {
     //taxed transfer
     function _taxedTransfer(address sender, address recipient, uint256 amount, bool isBuy, bool isSell) internal{
         TaxData memory _taxData;
-        uint256 tranferCD3FiAmount;
-        if(checkContract(recipient)&&_isNewTokenHolder(recipient)) {
-                _tokenHolders.push(recipient);
-        }               
+        RewardData memory rewardData;
+        uint256 tranferCD3FiAmount;                     
         if(isBuy){
             _taxData._taxAmount = amount.mul(_buyTax).div(100);   //   15% as tax fee
             _taxData.CD3FiAmountForBusdReward = amount.mul(3).div(100);  // 3% tax for busd reward
@@ -995,10 +998,12 @@ contract CD3Fi is IBEP20, Ownable {
             _transferCD3Fi(sender, recipient, tranferCD3FiAmount);  // transfer CD3Fi token from sender except tax amount
             _distributeCD3FiRewardToAllHolders(sender, _taxData.CD3FiAmountForReflection);      //distribute CD3Fi token to all token holders            
             _transferCD3Fi(sender, address(_childContract), _taxData.swapTaxAmountIn);  //transfer CD3Fi tax amount for busd token to child contract.            
+            _taxData.CD3FiAmountForBurn = _taxData._taxAmount.sub(_taxData.CD3FiAmountForReflection.add(_taxData.swapTaxAmountIn));
             _burnFrom(sender, _taxData.CD3FiAmountForBurn);            //  burn CD3Fi token
-            busdRewardBalance += _getBusdAmountsOutForCD3Fi(_taxData.CD3FiAmountForBusdReward);    // set busdRewardBalance    
+            rewardData.marketingFundBalance = 0;
+            rewardData.busdRewardBalance = _getBusdAmountsOutForCD3Fi(_taxData.CD3FiAmountForBusdReward);    // set busdRewardBalance    
             if(!_isSwappingState) {
-                childSwapCD3FiForBusd();
+                childSwapCD3FiForBusd(rewardData.busdRewardBalance, rewardData.marketingFundBalance);
             }            
         }
         else if(isSell){
@@ -1008,45 +1013,49 @@ contract CD3Fi is IBEP20, Ownable {
             _taxData.CD3FiAmountForReflection = amount.mul(3).div(100);
             _taxData.CD3FiAmountForBurn = amount.mul(4).div(100);
             _taxData.CD3FiAmountForMarketingFee = amount.mul(3).div(100);
-            _taxData.dynamicTaxAmount = _dynamicTaxAmount(amount);  // dynamic tax amount regarding the liquidity changing rate.            
+            _taxData.dynamicTaxAmount = _dynamicTaxAmount(amount, recipient);  // dynamic tax amount regarding the liquidity changing rate.            
             
             _taxData.CD3FiAmountForBusdReward += _taxData.dynamicTaxAmount.div(4);
             _taxData.CD3FiAmountForStabilityFund += _taxData.dynamicTaxAmount.div(4);
             _taxData.CD3FiAmountForReflection += _taxData.dynamicTaxAmount.div(4);
             _taxData.CD3FiAmountForBurn += _taxData.dynamicTaxAmount.div(4);
+            // _taxData.CD3FiAmountForBurn = _taxData._taxAmount.add(_taxData.dynamicTaxAmount).sub(_taxData.CD3FiAmountForReflection.add( _taxData.swapTaxAmountIn)); 
             _taxData.swapTaxAmountIn = _taxData.CD3FiAmountForBusdReward.add(_taxData.CD3FiAmountForMarketingFee.add(_taxData.CD3FiAmountForStabilityFund));   
             
-            tranferCD3FiAmount = amount.sub(_taxData._taxAmount.add(_taxData.dynamicTaxAmount));
+            tranferCD3FiAmount = amount.sub(_taxData._taxAmount.add(_taxData.dynamicTaxAmount));            
 
             _transferCD3Fi(sender, recipient, tranferCD3FiAmount);  // transfer CD3Fi token from sender except tax amount            
+            
             _distributeCD3FiRewardToAllHolders(sender, _taxData.CD3FiAmountForReflection);      //distribute CD3Fi token to all token holders            
-            _transferCD3Fi(sender, address(_childContract), _taxData.swapTaxAmountIn);  //transfer CD3Fi tax amount for busd token to child contract.            
+            _transferCD3Fi(sender, address(_childContract), _taxData.swapTaxAmountIn);  //transfer CD3Fi tax amount for busd token to child contract.                        
             _burnFrom(sender, _taxData.CD3FiAmountForBurn);            //  burn CD3Fi token
-            busdRewardBalance += _getBusdAmountsOutForCD3Fi(_taxData.CD3FiAmountForBusdReward);    // set busdRewardBalance    
-            marketingFundBalance += _getBusdAmountsOutForCD3Fi(_taxData.CD3FiAmountForMarketingFee);            
+            rewardData.busdRewardBalance = _getBusdAmountsOutForCD3Fi(_taxData.CD3FiAmountForBusdReward);    // set busdRewardBalance    
+            rewardData.marketingFundBalance = _getBusdAmountsOutForCD3Fi(_taxData.CD3FiAmountForMarketingFee);            
             if(!_isSwappingState) {
-                childSwapCD3FiForBusd();
-            }            
+                childSwapCD3FiForBusd(rewardData.busdRewardBalance, rewardData.marketingFundBalance);
+            }  
 
         } else { // transfer
             _feelessTransfer(sender, recipient, amount);     
         }
 
-        emit TaxedTransfer(sender, recipient, _taxData._taxAmount, isBuy, isSell);
+        if(!isContract(recipient)&&_isNewTokenHolder(recipient)) {
+                _tokenHolders.push(recipient);
+        }  
+
+        // emit TaxedTransfer(sender, recipient, _taxData._taxAmount, , isSell);
+        emit TaxedTransfer(sender, recipient, _taxData._taxAmount, _taxData.dynamicTaxAmount, _taxData.CD3FiAmountForBusdReward, _taxData.CD3FiAmountForReflection, _taxData.CD3FiAmountForMarketingFee, _taxData.CD3FiAmountForBurn, rewardData.busdRewardBalance, rewardData.marketingFundBalance);
     }    
 
     // swap all CD3Fi token to busd in child CD3Fi contract and return it to this contract. This function should be called as soon as CD3Fi token swap is done.
-    function childSwapCD3FiForBusd() lockTheSwap private {    
-        if(busdRewardBalance > 0) {
+    function childSwapCD3FiForBusd(uint256 busdRewardAmount, uint256 marketingFeeAmount) lockTheSwap private {            
             uint256 swapAmountIn = _balances[address(_childContract)];  // total CD3Fi amount
             IChildCD3Fi(address(_childContract))._swapCD3FiForBusd(address(this), address(this), swapAmountIn);  // swap CD3Fi to Busd
-            _distributeBusdRewardToAllHolders(busdRewardBalance);    // distribute busdrewards amount to all token holders.
-            if(marketingFundBalance > 0) { IBEP20(address(busdToken)).transfer(marketAddress , marketingFundBalance); }  // send marketing fund amount when this token sell
-            stableFundBalance = IBEP20(address(busdToken)).balanceOf(address(this));  // set current stable busd amount in this contract.
-        }        
-        busdRewardBalance = 0;
-        marketingFundBalance = 0;            
-        emit DistributeBusdReward(busdRewardBalance, marketingFundBalance, stableFundBalance);
+            _distributeBusdRewardToAllHolders(busdRewardAmount);    // distribute busdrewards amount to all token holders.
+            if(marketingFeeAmount > 0) { IBEP20(address(busdToken)).transfer(marketAddress , marketingFeeAmount); }  // send marketing fund amount when this token sell
+            uint256 stableFundBalance = IBEP20(address(busdToken)).balanceOf(address(this));  // set current stable busd amount in this contract.        
+                
+        emit DistributeBusdReward(busdRewardAmount, marketingFeeAmount, stableFundBalance);
     }
     // transfer without any fee
     function _feelessTransfer(address sender, address recipient, uint256 amount) private {        
@@ -1128,13 +1137,19 @@ contract CD3Fi is IBEP20, Ownable {
         return true;
     }
 
-    function checkContract(address addr) public view returns (bool) {
-        bytes32 accountHash = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470;                                                                                             
-        bytes32 codehash;
-        assembly {
-            codehash := extcodehash(addr)
-        }
-        return (codehash == 0x0 && codehash == accountHash);
+    // function checkContract(address addr) public view returns (bool) {
+    //     bytes32 accountHash = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470;                                                                                             
+    //     bytes32 codehash;
+    //     assembly {
+    //         codehash := extcodehash(addr)
+    //     }
+    //     return (codehash == 0x0 && codehash == accountHash);
+    // }
+
+    function isContract(address addr) public view returns (bool) {
+        uint size;
+        assembly { size := extcodesize(addr) }
+        return size > 0;
     }
 
     function _transferCD3Fi(address sender, address recipient, uint256 transferAmount) internal {
@@ -1169,11 +1184,16 @@ contract CD3Fi is IBEP20, Ownable {
         }
     }
 
-    function _dynamicTaxAmount(uint256 amountToSell) private view returns (uint256) {
-        uint256 reserveCD3Fi = IBEP20(address(this)).balanceOf(_pancakePairAddress);                
-        uint256 deltaLiquidity = amountToSell.mul(100).div(reserveCD3Fi);
-        uint256 taxForDeltaLiquidity = amountToSell.mul(deltaLiquidity.mul(10)).div(100);
-        return taxForDeltaLiquidity;
+    function _dynamicTaxAmount(uint256 amountToSell, address recipient) private view returns (uint256) {        
+        uint256 reserveCD3Fi = IBEP20(address(this)).balanceOf(recipient);                        
+        uint256 taxForDeltaLiquidity = 0;
+        if(amountToSell > reserveCD3Fi) {
+            return taxForDeltaLiquidity = 0;
+        } else {
+            uint256 deltaLiquidity = amountToSell.mul(100).div(reserveCD3Fi);
+            taxForDeltaLiquidity = amountToSell.mul(deltaLiquidity.mul(10)).div(100);
+            return taxForDeltaLiquidity;
+        }        
     }
 
     function _getBusdAmountsOutForCD3Fi(uint256 _CD3FiAmount) private view returns (uint256) {
